@@ -613,10 +613,10 @@ class DiffusionModel(keras.Model):
         # 1. 取得文字 Embedding
         text_embeddings = self.text_encoder(input_ids)
         
-        # [新增] CFG 訓練技巧：10% 的機率把文字條件歸零 (Unconditional Training)
-        if tf.random.uniform(()) < 0.1:
-            text_embeddings = tf.zeros_like(text_embeddings)
-
+        current_batch_size = tf.shape(text_embeddings)[0]
+        drop_mask = tf.random.uniform((current_batch_size, 1)) < 0.1
+        text_embeddings = tf.where(drop_mask, tf.zeros_like(text_embeddings), text_embeddings)
+        
         images = self.normalizer(images, training=True)
         noises = tf.random.normal(shape=(batch_size, image_size, image_size, 3))
 

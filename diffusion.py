@@ -168,92 +168,215 @@ def sinusoidal_embedding(x):
 # ==========================================
 
 # 1. ResidualBlock (大幅修正)
+# ==========================================
+# 1. 修改 ResidualBlock：加入 text_emb 參數
+# ==========================================
 class ResidualBlock(layers.Layer):
     def __init__(self, width, **kwargs):
         super().__init__(**kwargs)
         self.width = width
         
-        # 在 __init__ 預先定義所有子層 (Sub-layers)
-        # 這樣 Keras 才能 100% 確保抓到變數
         self.conv_1 = layers.Conv2D(width, kernel_size=3, padding="same", activation="swish")
         self.conv_2 = layers.Conv2D(width, kernel_size=3, padding="same")
-        
-        # 即使可能用不到 (Identity mapping)，也先定義好，避免變數遺失警告
         self.conv_skip = layers.Conv2D(width, kernel_size=1)
-        
         self.bn = layers.BatchNormalization(center=False, scale=False)
-        self.add_layer = layers.Add() # 改名為 add_layer 避免跟方法名衝突
+        self.add_layer = layers.Add()
+        
+        # [新增] 用來投影文字 Embedding 的全連接層
+        # 我們要把文字向量 (例如 512維) 轉成跟圖片一樣的 Channel 數 (例如 width)
+        self.text_proj = layers.Dense(width, activation="swish")
 
     def build(self, input_shape):
-        # === 關鍵修正 ===
-        # 實作這個方法來消除 "layer does not have a build() method" 警告
         super().build(input_shape)
 
-    def call(self, x):
-        input_width = x.shape[-1] # 取得輸入的 Channel 數
+    def call(self, inputs):
+        # inputs 包含 [x, text_emb]
+        x, text_emb = inputs 
         
-        # Skip Connection 邏輯
+        input_width = x.shape[-1]
+        
         if input_width == self.width:
             residual = x
         else:
             residual = self.conv_skip(x)
 
-        # 主路徑
         y = self.bn(x)
         y = self.conv_1(y)
-        y = self.conv_2(y)
         
-        # 相加
+        # [關鍵修改] 注入文字特徵
+        if text_emb is not None:
+            # 1. 投影文字向量: (Batch, TextDim) -> (Batch, Width)
+            t = self.text_proj(text_emb) 
+            # 2. 改變形狀以便與圖片相加: (Batch, 1, 1, Width)
+            t = tf.reshape(t, [-1, 1, 1, self.width])
+            # 3. 加到圖片特徵上
+            y = layers.Add()([y, t])
+
+        y = self.conv_2(y)
         return self.add_layer([y, residual])
 
-# 2. DownBlock (保持為函數，呼叫 Class)
-def down_block(x, skips, width, block_depth):
+# ==========================================
+# 2. 修改 DownBlock：傳遞 text_emb
+# ==========================================
+def down_block(x, text_emb, skips, width, block_depth):
     for _ in range(block_depth):
-        x = ResidualBlock(width)(x)
+        # 修改：傳入 list [x, text_emb]
+        x = ResidualBlock(width)([x, text_emb]) 
         skips.append(x)
     x = layers.AveragePooling2D(pool_size=2)(x)
     return x
 
-# 3. UpBlock (保持為函數，呼叫 Class)
-def up_block(x, skips, width, block_depth):
+# ==========================================
+# 3. 修改 UpBlock：傳遞 text_emb
+# ==========================================
+def up_block(x, text_emb, skips, width, block_depth):
     x = layers.UpSampling2D(size=2, interpolation="bilinear")(x)
     for _ in range(block_depth):
         x = layers.Concatenate()([x, skips.pop()])
-        x = ResidualBlock(width)(x)
+        # 修改：傳入 list [x, text_emb]
+        x = ResidualBlock(width)([x, text_emb])
     return x
 
-# 4. get_network (結構微調)
+# ==========================================
+# 4. 修改 get_network：配置文字注入路徑
+# ==========================================
 def get_network(image_size, widths, block_depth, text_embedding_dim=512):
     noisy_images = keras.Input(shape=(image_size, image_size, 3))
     noise_variances = keras.Input(shape=(1, 1, 1))
     text_embeddings = keras.Input(shape=(text_embedding_dim,))
 
+    # 時間 Embedding (保持不變)
     e = layers.Lambda(sinusoidal_embedding, output_shape=(1, 1, 32))(noise_variances)
     e = layers.UpSampling2D(size=image_size, interpolation="nearest")(e)
 
-    t = layers.Dense(32)(text_embeddings)
-    t = layers.Activation("swish")(t)
-    t = layers.Reshape((1, 1, 32))(t)
-    t = layers.UpSampling2D(size=image_size, interpolation="nearest")(t)
-
+    # 初始合併 (保留原本的合併，當作 Base)
     x = layers.Conv2D(widths[0], kernel_size=1)(noisy_images)
-    x = layers.Concatenate()([x, e, t])
+    x = layers.Concatenate()([x, e]) 
+    # 注意：這裡我不把 text 放在 concatenate 了，因為我們要在後面 Deep Injection
 
     skips = []
     
+    # Downpath
     for width in widths[:-1]:
-        x = down_block(x, skips, width, block_depth)
+        # 修改：把 text_embeddings 傳進去
+        x = down_block(x, text_embeddings, skips, width, block_depth)
 
+    # Bottleneck
     for _ in range(block_depth):
-        x = ResidualBlock(widths[-1])(x)
+        x = ResidualBlock(widths[-1])([x, text_embeddings])
 
+    # Uppath
     for width in reversed(widths[:-1]):
-        x = up_block(x, skips, width, block_depth)
+        x = up_block(x, text_embeddings, skips, width, block_depth)
 
     x = layers.Conv2D(3, kernel_size=1, kernel_initializer="zeros")(x)
 
     return keras.Model([noisy_images, noise_variances, text_embeddings], x, name="residual_unet")
 
+# ==========================================
+# 1. 修改 ResidualBlock：加入 text_emb 參數
+# ==========================================
+class ResidualBlock(layers.Layer):
+    def __init__(self, width, **kwargs):
+        super().__init__(**kwargs)
+        self.width = width
+        
+        self.conv_1 = layers.Conv2D(width, kernel_size=3, padding="same", activation="swish")
+        self.conv_2 = layers.Conv2D(width, kernel_size=3, padding="same")
+        self.conv_skip = layers.Conv2D(width, kernel_size=1)
+        self.bn = layers.BatchNormalization(center=False, scale=False)
+        self.add_layer = layers.Add()
+        
+        # [新增] 用來投影文字 Embedding 的全連接層
+        # 我們要把文字向量 (例如 512維) 轉成跟圖片一樣的 Channel 數 (例如 width)
+        self.text_proj = layers.Dense(width, activation="swish")
+
+    def build(self, input_shape):
+        super().build(input_shape)
+
+    def call(self, inputs):
+        # inputs 包含 [x, text_emb]
+        x, text_emb = inputs 
+        
+        input_width = x.shape[-1]
+        
+        if input_width == self.width:
+            residual = x
+        else:
+            residual = self.conv_skip(x)
+
+        y = self.bn(x)
+        y = self.conv_1(y)
+        
+        # [關鍵修改] 注入文字特徵
+        if text_emb is not None:
+            # 1. 投影文字向量: (Batch, TextDim) -> (Batch, Width)
+            t = self.text_proj(text_emb) 
+            # 2. 改變形狀以便與圖片相加: (Batch, 1, 1, Width)
+            t = tf.reshape(t, [-1, 1, 1, self.width])
+            # 3. 加到圖片特徵上
+            y = layers.Add()([y, t])
+
+        y = self.conv_2(y)
+        return self.add_layer([y, residual])
+
+# ==========================================
+# 2. 修改 DownBlock：傳遞 text_emb
+# ==========================================
+def down_block(x, text_emb, skips, width, block_depth):
+    for _ in range(block_depth):
+        # 修改：傳入 list [x, text_emb]
+        x = ResidualBlock(width)([x, text_emb]) 
+        skips.append(x)
+    x = layers.AveragePooling2D(pool_size=2)(x)
+    return x
+
+# ==========================================
+# 3. 修改 UpBlock：傳遞 text_emb
+# ==========================================
+def up_block(x, text_emb, skips, width, block_depth):
+    x = layers.UpSampling2D(size=2, interpolation="bilinear")(x)
+    for _ in range(block_depth):
+        x = layers.Concatenate()([x, skips.pop()])
+        # 修改：傳入 list [x, text_emb]
+        x = ResidualBlock(width)([x, text_emb])
+    return x
+
+# ==========================================
+# 4. 修改 get_network：配置文字注入路徑
+# ==========================================
+def get_network(image_size, widths, block_depth, text_embedding_dim=512):
+    noisy_images = keras.Input(shape=(image_size, image_size, 3))
+    noise_variances = keras.Input(shape=(1, 1, 1))
+    text_embeddings = keras.Input(shape=(text_embedding_dim,))
+
+    # 時間 Embedding (保持不變)
+    e = layers.Lambda(sinusoidal_embedding, output_shape=(1, 1, 32))(noise_variances)
+    e = layers.UpSampling2D(size=image_size, interpolation="nearest")(e)
+
+    # 初始合併 (保留原本的合併，當作 Base)
+    x = layers.Conv2D(widths[0], kernel_size=1)(noisy_images)
+    x = layers.Concatenate()([x, e]) 
+    # 注意：這裡我不把 text 放在 concatenate 了，因為我們要在後面 Deep Injection
+
+    skips = []
+    
+    # Downpath
+    for width in widths[:-1]:
+        # 修改：把 text_embeddings 傳進去
+        x = down_block(x, text_embeddings, skips, width, block_depth)
+
+    # Bottleneck
+    for _ in range(block_depth):
+        x = ResidualBlock(widths[-1])([x, text_embeddings])
+
+    # Uppath
+    for width in reversed(widths[:-1]):
+        x = up_block(x, text_embeddings, skips, width, block_depth)
+
+    x = layers.Conv2D(3, kernel_size=1, kernel_initializer="zeros")(x)
+
+    return keras.Model([noisy_images, noise_variances, text_embeddings], x, name="residual_unet")
 
 sample_sentences = [
     "the flower shown has yellow anther red pistil and bright red petals.",
@@ -433,30 +556,44 @@ class DiffusionModel(keras.Model):
         pred_images = (noisy_images - noise_rates * pred_noises) / signal_rates
         return pred_noises, pred_images
 
-    def reverse_diffusion(self, initial_noise, diffusion_steps, text_embeddings):
-        # reverse diffusion = sampling
+    def reverse_diffusion(self, initial_noise, diffusion_steps, text_embeddings, guidance_scale=5.5):
+        # guidance_scale: 數值越大，越聽文字的話 (建議設 3.0 ~ 7.5)
+        
         num_images = initial_noise.shape[0]
         step_size = 1.0 / diffusion_steps
 
-        # important line:
-        # at the first sampling step, the "noisy image" is pure noise
-        # but its signal rate is assumed to be nonzero (min_signal_rate)
         next_noisy_images = initial_noise
+        
+        # 準備一個全零的 embedding (代表無條件)
+        uncond_embeddings = tf.zeros_like(text_embeddings)
+
         for step in range(diffusion_steps):
-            # TODO: implement the reverse diffusion process
-            # This process gradually reduces the noise to generate a clearer image
             diffusion_times = 1.0 - step * step_size
             next_diffusion_times = 1.0 - (step + 1) * step_size
-            difussion_times = tf.ones((num_images, 1, 1, 1), dtype=tf.float32) * diffusion_times
-            next_difussion_times = tf.ones((num_images, 1, 1, 1), dtype=tf.float32) * next_diffusion_times
-            noise_rates, signal_rates = self.diffusion_schedule(difussion_times)
-            next_noise_rates, next_signal_rates = self.diffusion_schedule(next_difussion_times)
-
-            # remix the predicted components
-            # Use the signal_rate and noise_rate from the next step to recombine image and noise components
             
-            pred_noises, pred_images = self.denoise(next_noisy_images, noise_rates, signal_rates, text_embeddings, training=False) # network used in eval mode
-            next_noisy_images = next_signal_rates * pred_images + next_noise_rates * pred_noises # remix the predicted components
+            # 製作 shape 正確的時間訊號
+            # 注意：這裡需要把 scalar 擴展成 (Batch, 1, 1, 1)
+            difussion_times_tensor = tf.ones((num_images, 1, 1, 1), dtype=tf.float32) * diffusion_times
+            
+            noise_rates, signal_rates = self.diffusion_schedule(difussion_times_tensor)
+            next_noise_rates, next_signal_rates = self.diffusion_schedule(tf.ones((num_images, 1, 1, 1), dtype=tf.float32) * next_diffusion_times)
+
+            # [關鍵修改] Classifier-Free Guidance (CFG)
+            # 1. 預測有文字條件的噪音
+            pred_noises_cond, pred_images_cond = self.denoise(
+                next_noisy_images, noise_rates, signal_rates, text_embeddings, training=False
+            )
+            
+            # 2. 預測無文字條件的噪音
+            pred_noises_uncond, pred_images_uncond = self.denoise(
+                next_noisy_images, noise_rates, signal_rates, uncond_embeddings, training=False
+            )
+            
+            # 3. 混合兩者：將"文字造成的差異"放大 guidance_scale 倍
+            pred_noises = pred_noises_uncond + guidance_scale * (pred_noises_cond - pred_noises_uncond)
+            pred_images = pred_images_uncond + guidance_scale * (pred_images_cond - pred_images_uncond)
+
+            next_noisy_images = next_signal_rates * pred_images + next_noise_rates * pred_noises
 
         return pred_images
 
@@ -472,27 +609,31 @@ class DiffusionModel(keras.Model):
 
     def train_step(self, data):
         input_ids, images = data
+        
+        # 1. 取得文字 Embedding
         text_embeddings = self.text_encoder(input_ids)
-        # normalize images to have standard deviation of 1, like the noises
+        
+        # [新增] CFG 訓練技巧：10% 的機率把文字條件歸零 (Unconditional Training)
+        if tf.random.uniform(()) < 0.1:
+            text_embeddings = tf.zeros_like(text_embeddings)
+
         images = self.normalizer(images, training=True)
         noises = tf.random.normal(shape=(batch_size, image_size, image_size, 3))
 
-        # sample uniform random diffusion times
+        # (以下保持不變...)
         diffusion_times = tf.random.uniform(
             shape=(tf.shape(images)[0], 1, 1, 1), minval=0.0, maxval=1.0
         )
         noise_rates, signal_rates = self.diffusion_schedule(diffusion_times)
-        # mix the images with noises accordingly
         noisy_images = signal_rates * images + noise_rates * noises
 
         with tf.GradientTape() as tape:
-            # train the network to separate noisy images to their components
             pred_noises, pred_images = self.denoise(
                 noisy_images, noise_rates, signal_rates, text_embeddings, training=True
             )
 
-            noise_loss = self.loss(noises, pred_noises)  # used for training
-            image_loss = self.loss(images, pred_images)  # only used as metric
+            noise_loss = self.loss(noises, pred_noises)
+            image_loss = self.loss(images, pred_images)
 
         gradients = tape.gradient(noise_loss, self.network.trainable_weights)
         self.optimizer.apply_gradients(zip(gradients, self.network.trainable_weights))
@@ -500,11 +641,9 @@ class DiffusionModel(keras.Model):
         self.noise_loss_tracker.update_state(noise_loss)
         self.image_loss_tracker.update_state(image_loss)
 
-        # track the exponential moving averages of weights
         for weight, ema_weight in zip(self.network.weights, self.ema_network.weights):
             ema_weight.assign(ema * ema_weight + (1 - ema) * weight)
 
-        # KID is not measured during the training phase for computational efficiency
         return {m.name: m.result() for m in self.metrics[:-1]}
 
     def test_step(self, data):

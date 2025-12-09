@@ -65,7 +65,7 @@ block_depth = 2
 # optimization
 batch_size = 32
 ema = 0.999
-learning_rate = 1e-3
+learning_rate = 1e-4
 weight_decay = 1e-4
 
 id2word_dict = dict(np.load('./dictionary/id2Word.npy'))
@@ -110,8 +110,8 @@ def training_data_generator(input_ids, image_path):
     img.set_shape([64, 64, 3])
     
     # Data Augmentation
-    distorted_image = tf.image.random_crop(img, [48, 48, 3])
-    distorted_image = tf.image.resize(distorted_image, [64, 64])
+    # distorted_image = tf.image.random_crop(img, [48, 48, 3])
+    # distorted_image = tf.image.resize(distorted_image, [64, 64])
     distorted_image = tf.image.random_flip_left_right(distorted_image)
     distorted_image = tf.image.random_brightness(distorted_image, max_delta=0.2)
     distorted_image = tf.clip_by_value(distorted_image, 0.0, 1.0)
@@ -726,7 +726,7 @@ text_encoder = ClipTextEncoder()
 model = DiffusionModel(image_size, widths, block_depth, text_encoder)
 model.compile(
     optimizer=tf.keras.optimizers.AdamW(learning_rate=learning_rate, weight_decay=weight_decay),
-    loss=tf.keras.losses.MeanAbsoluteError(),
+    loss=tf.keras.losses.MeanSquaredError(),
 )
 
 train_dataset = dataset_generator(data_path + '/text2ImgData.pkl', batch_size)
